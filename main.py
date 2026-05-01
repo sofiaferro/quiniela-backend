@@ -1,7 +1,8 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 from openai import OpenAI
 import os
+import time
 
 from quiniela.interprete import interpretar_sueno, construir_respuesta_hablada
 
@@ -17,9 +18,8 @@ def health():
 
 @app.post("/voice")
 async def voice(audio: UploadFile = File(...)):
-    import time
     t_start = time.time()
-    
+
     # 1. STT
     audio_bytes = await audio.read()
     t_stt_start = time.time()
@@ -32,7 +32,7 @@ async def voice(audio: UploadFile = File(...)):
     sueno = transcription.text
     print(f"\n⏱️  STT (whisper-1): {t_stt:.2f}s")
     print(f"🌙 Sueño: {sueno}")
-    
+
     # 2. LLM
     t_llm_start = time.time()
     resultado = interpretar_sueno(sueno, client)
@@ -40,56 +40,28 @@ async def voice(audio: UploadFile = File(...)):
     print(f"⏱️  LLM (gpt-4o-mini): {t_llm:.2f}s")
     print(f"🎯 Símbolos: {resultado['simbolos']} → {resultado['numeros']}")
     print(f"🎲 Jugada: {resultado['jugada']}")
-    
-    # 3. TTS
+
+    # 3. TTS streaming
     respuesta_texto = construir_respuesta_hablada(resultado)
     t_tts_start = time.time()
-    audio_respuesta = client.audio.speech.create(
-        model="tts-1",
-        voice="nova",
-        input=respuesta_texto,
-        response_format="wav",
-    )
-    t_tts = time.time() - t_tts_start
-    print(f"⏱️  TTS (tts-1): {t_tts:.2f}s")
-    
-    t_total = time.time() - t_start
-    print(f"⏱️  TOTAL backend: {t_total:.2f}s\n")
-    
-    return Response(
-        content=audio_respuesta.content,
-        media_type="audio/wav",
-    )
-    # 1. STT: audio -> texto
-    audio_bytes = await audio.read()
-    
-    transcription = client.audio.transcriptions.create(
-        model="whisper-1",
-        file=("audio.wav", audio_bytes, "audio/wav"),
-        language="es",
-    )
-    sueno = transcription.text
-    print(f"\n🌙 Sueño: {sueno}")
-    
-    # 2. Interpretar con LLM + diccionario
-    resultado = interpretar_sueno(sueno, client)
-    print(f"🎯 Símbolos: {resultado['simbolos']}")
-    print(f"🔢 Números: {resultado['numeros']}")
-    print(f"🎲 Jugada: {resultado['jugada']}")
-    print(f"💭 {resultado['razonamiento']}\n")
-    
-    # 3. Texto de respuesta
-    respuesta_texto = construir_respuesta_hablada(resultado)
-    
-    # 4. TTS: texto -> audio
-    audio_respuesta = client.audio.speech.create(
-        model="tts-1",
-        voice="nova",
-        input=respuesta_texto,
-        response_format="wav",
-    )
-    
-    return Response(
-        content=audio_respuesta.content,
-        media_type="audio/wav",
+
+    def stream_audio():
+        state = {"first_chunk_time": None}
+        with client.audio.speech.with_streaming_response.create(
+            model="tts-1",
+            voice="nova",
+            input=respuesta_texto,
+            response_format="mp3",
+        ) as response:
+            for chunk in response.iter_bytes(chunk_size=4096):
+                if state["first_chunk_time"] is None:
+                    state["first_chunk_time"] = time.time() - t_tts_start
+                    print(f"⏱️  TTS primer chunk: {state['first_chunk_time']:.2f}s")
+                    print(f"⏱️  TOTAL hasta primer chunk: {time.time() - t_start:.2f}s")
+                yield chunk
+        print(f"⏱️  TTS streaming completo: {time.time() - t_tts_start:.2f}s")
+
+    return StreamingResponse(
+        stream_audio(),
+        media_type="audio/mpeg",
     )
